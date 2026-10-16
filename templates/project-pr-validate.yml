@@ -1,0 +1,11 @@
+# Gate 2 für dieses Projekt – die Prüfschritte liegen zentral im agent-kit.
+name: PR-Validierung
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    uses: david20311/agent-kit/.github/workflows/pr-validate.yml@main
+    secrets: inherit

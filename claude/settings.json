@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sf sobject describe:*)",
+      "Bash(sf data query:*)",
+      "Bash(sf project retrieve start:*)",
+      "Bash(sf project deploy start:*)",
+      "Bash(sf project deploy validate:*)",
+      "Bash(sf apex run test:*)",
+      "Bash(sf code-analyzer run:*)",
+      "Bash(git checkout:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(grep:*)",
+      "Bash(mkdir:*)",
+      "Bash(ls:*)"
+    ],
+    "deny": [
+      "Bash(sf org login:*)",
+      "Bash(sf org logout:*)",
+      "Bash(sf org delete:*)",
+      "Bash(sf data delete:*)",
+      "Bash(sf data update:*)",
+      "Bash(sf data upsert:*)",
+      "Bash(sf data import:*)",
+      "Bash(sf apex run --:*)",
+      "Bash(git push:*)",
+      "Read(.env)",
+      "Read(**/*.key)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"" }
+        ]
+      },
+      {
+        "matcher": "mcp__.*[Aa]tlassian.*",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"" }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"" }
+        ]
+      }
+    ]
+  }
+}

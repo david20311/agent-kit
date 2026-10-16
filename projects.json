@@ -1,0 +1,21 @@
+{
+  "_hinweis": "Positivliste: Nur hier eingetragene Jira-Projekte dürfen Agent-Läufe auslösen, und nur im angegebenen Repo.",
+  "jira_base_url": "https://techrockets.atlassian.net",
+  "defaults": {
+    "status": {
+      "analyse": "In Analyse",
+      "design_review": "Design-Review",
+      "approved": "Freigegeben",
+      "build": "In Umsetzung",
+      "code_review": "Code-Review"
+    }
+  },
+  "projects": {
+    "CT": {
+      "name": "Claude Test",
+      "repo": "david20311/claude-jira-bot",
+      "local_path": "~/Downloads/sf-agent-template",
+      "approvers": ["712020:822e5abc-c36b-428a-adc5-d5aa8fa57e76"]
+    }
+  }
+}

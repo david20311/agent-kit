@@ -1,0 +1,32 @@
+# Agent-Lauf für dieses Projekt – die Logik liegt zentral im agent-kit.
+# Auslöser: Jira-Automation (repository_dispatch) oder manuell im Actions-Tab.
+name: Agent-Lauf
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticket:
+        description: "Jira-Ticket, z. B. CT-123"
+        required: true
+      phase:
+        description: "analysieren (bis Gate 1) oder bauen (bis Gate 2)"
+        required: true
+        type: choice
+        options: [analysieren, bauen]
+  repository_dispatch:
+    types: [agent-run]   # client_payload: { "ticket": "CT-123", "phase": "analysieren" }
+
+concurrency:
+  group: agent-${{ github.event.inputs.ticket || github.event.client_payload.ticket }}
+  cancel-in-progress: false
+
+jobs:
+  agent:
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: david20311/agent-kit/.github/workflows/agent-run.yml@main
+    with:
+      ticket: ${{ github.event.inputs.ticket || github.event.client_payload.ticket }}
+      phase: ${{ github.event.inputs.phase || github.event.client_payload.phase }}
+    secrets: inherit

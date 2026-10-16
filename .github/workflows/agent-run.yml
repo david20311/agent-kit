@@ -1,0 +1,221 @@
+# Zentraler Agent-Lauf für alle Projekt-Repos (reusable workflow).
+# Projekt-Repos rufen ihn über einen dünnen Workflow auf (Vorlage: templates/project-agent-run.yml).
+#
+#   Ticket in „Zu erledigen“ dem Agent-User zuweisen -> phase=analysieren -> Design als Kommentar, Status Design-Review
+#   Design-Review -> „In Analyse“ (Feedback)          -> phase=analysieren -> Design überarbeitet
+#   Übergang nach „Freigegeben“ (durch Mensch)        -> phase=bauen       -> Umsetzung, Draft-PR, Status Code-Review
+# Ergebnisse erwähnen den Ersteller (@), Jira benachrichtigt ihn per E-Mail.
+#
+# Welches Jira-Projekt in welchem Repo laufen darf, steht in projects.json (Positivliste).
+name: Agent-Lauf (agent-kit)
+
+on:
+  workflow_call:
+    inputs:
+      ticket:
+        type: string
+        required: true
+      phase:
+        type: string
+        required: true
+      kit_repo:
+        description: "Repo des agent-kit (für Skripte und Registry)"
+        type: string
+        default: david20311/agent-kit
+      kit_ref:
+        description: "Version des agent-kit (Branch oder Tag)"
+        type: string
+        default: main
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      SF_AUTH_URL_AGENT_DEV:
+        required: true
+      JIRA_USER:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+      AGENT_KIT_TOKEN:
+        description: "Lesetoken für ein privates agent-kit-Repo"
+        required: false
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TICKET: ${{ inputs.ticket }}
+      PHASE: ${{ inputs.phase }}
+      JIRA_USER: ${{ secrets.JIRA_USER }}
+      JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Payload kommt von außen: nur gültige Ticket-Keys und Phasen zulassen
+      - name: Eingaben prüfen
+        run: |
+          [[ "$TICKET" =~ ^[A-Z][A-Z0-9]+-[0-9]+$ ]] || { echo "::error::Ungültiges Ticket '$TICKET'"; exit 1; }
+          [[ "$PHASE" == "analysieren" || "$PHASE" == "bauen" ]] || { echo "::error::Ungültige Phase '$PHASE'"; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: agent-kit laden
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kit_repo }}
+          ref: ${{ inputs.kit_ref }}
+          path: .agent-kit
+          token: ${{ secrets.AGENT_KIT_TOKEN || github.token }}
+
+      # Kit aus dem Arbeitsverzeichnis nehmen (wird sonst mitcommittet) und Registry prüfen:
+      # läuft dieses Ticket überhaupt in diesem Repo?
+      - name: Projekt aus Registry prüfen
+        run: |
+          mv .agent-kit "$RUNNER_TEMP/agent-kit"
+          echo "KIT=$RUNNER_TEMP/agent-kit" >> "$GITHUB_ENV"
+          python3 "$RUNNER_TEMP/agent-kit/scripts/project.py" env "$TICKET" "$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
+
+      - name: Branch vorbereiten
+        run: |
+          git config user.name "claude-agent"
+          git config user.email "claude-agent@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin "feature/$TICKET"; then
+            git checkout "feature/$TICKET"
+          else
+            git checkout -b "feature/$TICKET"
+          fi
+
+      # Gate 1: Freigabe wird aus dem Jira-Verlauf gelesen, nicht aus dem Webhook übernommen.
+      # Die Statuszeile setzt die Pipeline im Namen des Menschen, der in Jira freigegeben hat.
+      - name: Gate 1 – Freigabe aus Jira übernehmen
+        if: inputs.phase == 'bauen'
+        run: |
+          DESIGN="docs/design/$TICKET.md"
+          [ -f "$DESIGN" ] || { echo "::error::$DESIGN fehlt – erst analysieren."; exit 1; }
+          python3 "$KIT/scripts/jira.py" approval "$TICKET" "$ST_APPROVED" > /tmp/approval.env
+          APPROVER=$(sed -n 's/^approver=//p' /tmp/approval.env)
+          python3 - "$DESIGN" /tmp/approval.env <<'PY'
+          import re, sys
+          path, env = sys.argv[1], dict(l.rstrip("\n").split("=", 1) for l in open(sys.argv[2], encoding="utf-8"))
+          line = f"Status: Freigegeben (Jira: {env['approver']}, {env['approved_at']})"
+          text = open(path, encoding="utf-8").read()
+          text, n = re.subn(r"^Status:.*$", line, text, count=1, flags=re.M)
+          if not n:
+              sys.exit("Keine Statuszeile im Design-Dokument gefunden.")
+          open(path, "w", encoding="utf-8").write(text)
+          PY
+          git add "$DESIGN"
+          git diff --cached --quiet || git commit -m "$TICKET: Design freigegeben durch $APPROVER (Jira)"
+
+      - name: Jira – Start melden
+        run: |
+          if [ "$PHASE" = "analysieren" ]; then TARGET="$ST_ANALYSE"; MSG="Analyse und Solution Design"; else TARGET="$ST_BUILD"; MSG="Umsetzung des freigegebenen Designs"; fi
+          printf '🤖 **Claude Agent** startet: %s.\n\nVerlauf: [GitHub Actions](%s)\n' "$MSG" "$RUN_URL" > /tmp/start.md
+          python3 "$KIT/scripts/jira.py" comment "$TICKET" /tmp/start.md
+          python3 "$KIT/scripts/jira.py" transition "$TICKET" "$TARGET"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Werkzeuge installieren
+        run: |
+          sudo apt-get install -y -qq pandoc >/dev/null
+          npm install -g @salesforce/cli @anthropic-ai/claude-code
+          sf plugins install code-analyzer
+
+      # Nur die Agent-Sandbox des Projekts wird authentifiziert. Produktion existiert in diesem Job nicht.
+      - name: Agent-Sandbox authentifizieren
+        run: |
+          echo "${{ secrets.SF_AUTH_URL_AGENT_DEV }}" > /tmp/auth.txt
+          sf org login sfdx-url --sfdx-url-file /tmp/auth.txt --alias agent-dev
+          rm /tmp/auth.txt
+
+      # Ticket inkl. Kommentaren (= Feedback zum Design) nach .tmp/ – wird nicht committet
+      - name: Jira-Ticket laden
+        run: python3 "$KIT/scripts/jira.py" fetch "$TICKET" ".tmp/tickets/$TICKET.md"
+
+      - name: Claude-Agents ausführen
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          PROMPT="/$PHASE $TICKET. Die Anforderung samt aller Kommentare liegt in .tmp/tickets/$TICKET.md."
+          if [ "$PHASE" = "analysieren" ] && [ -f "docs/design/$TICKET.md" ]; then
+            PROMPT="$PROMPT Es gibt bereits ein Design-Dokument: Überarbeite es anhand des Feedbacks in den neueren Kommentaren und fasse die Änderungen zusammen."
+          fi
+          claude -p "$PROMPT" \
+            --permission-mode acceptEdits \
+            --max-turns 150 \
+            --output-format json > /tmp/claude-result.json
+          jq -r '.result // "kein Ergebnis"' /tmp/claude-result.json > /tmp/summary.md
+
+      - name: Agent-Protokoll sichern
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-log-${{ inputs.ticket }}-${{ inputs.phase }}
+          path: |
+            /tmp/claude-result.json
+            .claude/hooks/audit.log
+
+      # Push und PR macht die Pipeline, nicht der Agent (git push ist im Hook gesperrt)
+      - name: Branch pushen und Pull Request aktualisieren
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git add -A ':!.claude/hooks/audit.log'
+          git diff --cached --quiet || git commit -m "$TICKET: Agent-Lauf ($PHASE)"
+          git push origin "feature/$TICKET"
+          if gh pr view "feature/$TICKET" >/dev/null 2>&1; then
+            gh pr comment "feature/$TICKET" --body-file /tmp/summary.md
+          else
+            gh pr create --draft --base main --head "feature/$TICKET" \
+              --title "$TICKET" --body-file /tmp/summary.md
+          fi
+          echo "url=$(gh pr view "feature/$TICKET" --json url -q .url)" >> "$GITHUB_OUTPUT"
+
+      - name: Jira – Ergebnis zurückmelden
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+        run: |
+          DESIGN="docs/design/$TICKET.md"
+          if [ "$PHASE" = "analysieren" ] && [ -f "$DESIGN" ]; then
+            {
+              echo "🤖 **Solution Design (Entwurf)** – bitte prüfen."
+              echo
+              echo "- Passt es: Ticket nach **$ST_APPROVED** verschieben → die Umsetzung startet automatisch."
+              echo "- Änderungswünsche: als Kommentar schreiben und das Ticket zurück nach **$ST_ANALYSE** verschieben."
+              echo
+              echo "Branch/PR: $PR_URL"
+              echo
+              echo "---"
+              echo
+              cat "$DESIGN"
+            } > /tmp/jira.md
+            python3 "$KIT/scripts/jira.py" comment "$TICKET" /tmp/jira.md --mention-reporter
+            python3 "$KIT/scripts/jira.py" attach "$TICKET" "$DESIGN"
+            python3 "$KIT/scripts/jira.py" transition "$TICKET" "$ST_DESIGN_REVIEW"
+          elif [ "$PHASE" = "analysieren" ]; then
+            # Kein Design: Agent hat wegen Lücken in der Anforderung gestoppt
+            { echo "🤖 **Rückfragen vor dem Design** – bitte im Ticket ergänzen und das Ticket zurück nach **$ST_ANALYSE** verschieben."; echo; cat /tmp/summary.md; } > /tmp/jira.md
+            python3 "$KIT/scripts/jira.py" comment "$TICKET" /tmp/jira.md --mention-reporter
+            python3 "$KIT/scripts/jira.py" transition "$TICKET" "$ST_DESIGN_REVIEW"
+          else
+            { echo "🤖 **Umsetzung abgeschlossen** – Pull Request zur Prüfung: $PR_URL"; echo; cat /tmp/summary.md; } > /tmp/jira.md
+            python3 "$KIT/scripts/jira.py" comment "$TICKET" /tmp/jira.md --mention-reporter
+            python3 "$KIT/scripts/jira.py" transition "$TICKET" "$ST_CODE_REVIEW"
+          fi
+          python3 "$KIT/scripts/jira.py" assign-reporter "$TICKET"
+
+      # Nur melden, wenn das Projekt in der Registry steht (sonst ist JIRA_BASE_URL nicht gesetzt)
+      - name: Jira – Fehler melden
+        if: failure() && env.JIRA_BASE_URL != ''
+        run: |
+          printf '🤖 ⚠️ **Agent-Lauf (%s) fehlgeschlagen.** Details: [GitHub Actions](%s)\n' "$PHASE" "$RUN_URL" > /tmp/fail.md
+          python3 "$KIT/scripts/jira.py" comment "$TICKET" /tmp/fail.md --mention-reporter || true
+          python3 "$KIT/scripts/jira.py" assign-reporter "$TICKET" || true
